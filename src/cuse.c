@@ -92,6 +92,8 @@ struct kmscon_cuse {
 	int kbd_fd;
 	unsigned char led_state;
 	unsigned char kbd_flags;
+	int kb_mode;
+	int kd_mode;
 
 	unsigned int vtnr;
 
@@ -592,6 +594,63 @@ static void handle_ioctl(struct kmscon_cuse *cuse,
 		cuse->kbd_flags = (unsigned char)in->arg & 0x77;
 		cuse_reply_ioctl(cuse, hdr->unique, 0, NULL, 0);
 		return;
+	case KDGKBTYPE: {
+		unsigned char val = KB_101;
+
+		if (in->out_size < sizeof(val)) {
+			struct fuse_ioctl_iovec fiov = {
+				.base = in->arg,
+				.len = sizeof(val),
+			};
+			cuse_reply_ioctl_retry(cuse, hdr->unique,
+					       NULL, 0, &fiov, 1);
+		} else {
+			cuse_reply_ioctl(cuse, hdr->unique, 0,
+					 &val, sizeof(val));
+		}
+		return;
+	}
+	case KDGETMODE: {
+		int val = cuse->kd_mode;
+
+		if (in->out_size < sizeof(val)) {
+			struct fuse_ioctl_iovec fiov = {
+				.base = in->arg,
+				.len = sizeof(val),
+			};
+			cuse_reply_ioctl_retry(cuse, hdr->unique,
+					       NULL, 0, &fiov, 1);
+		} else {
+			cuse_reply_ioctl(cuse, hdr->unique, 0,
+					 &val, sizeof(val));
+		}
+		return;
+	}
+	case KDSETMODE:
+		if ((int)in->arg == KD_TEXT || (int)in->arg == KD_GRAPHICS)
+			cuse->kd_mode = (int)in->arg;
+		cuse_reply_ioctl(cuse, hdr->unique, 0, NULL, 0);
+		return;
+	case KDGKBMODE: {
+		int val = cuse->kb_mode;
+
+		if (in->out_size < sizeof(val)) {
+			struct fuse_ioctl_iovec fiov = {
+				.base = in->arg,
+				.len = sizeof(val),
+			};
+			cuse_reply_ioctl_retry(cuse, hdr->unique,
+					       NULL, 0, &fiov, 1);
+		} else {
+			cuse_reply_ioctl(cuse, hdr->unique, 0,
+					 &val, sizeof(val));
+		}
+		return;
+	}
+	case KDSKBMODE:
+		cuse->kb_mode = (int)in->arg;
+		cuse_reply_ioctl(cuse, hdr->unique, 0, NULL, 0);
+		return;
 	/*
 	 * TIOCGPGRP and TIOCSPGRP check that the fd is the caller's
 	 * controlling terminal.  Since the daemon's ctty is not the
@@ -1038,6 +1097,8 @@ int kmscon_cuse_new(struct kmscon_cuse **out, struct ev_eloop *eloop,
 	cuse->cuse_fd = -1;
 	cuse->spkr_fd = -1;
 	cuse->kbd_fd = -1;
+	cuse->kb_mode = K_UNICODE;
+	cuse->kd_mode = KD_TEXT;
 	cuse->vtnr = vtnr;
 	cuse->slave_fd = slave_fd;
 	if (slave_path)
