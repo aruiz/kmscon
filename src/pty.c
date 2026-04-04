@@ -37,6 +37,7 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include "cuse.h"
 #include "eloop.h"
 #include "pty.h"
 #include "shl_log.h"
@@ -60,6 +61,9 @@ struct kmscon_pty {
 	struct shl_ring *msgbuf;
 	char io_buf[KMSCON_NREAD];
 
+	struct kmscon_cuse *cuse;
+	int slave_fd;
+
 	kmscon_pty_input_cb input_cb;
 	void *data;
 
@@ -70,6 +74,7 @@ struct kmscon_pty {
 	char *vtnr;
 	bool env_reset;
 	bool backspace_delete;
+	bool cuse_enabled;
 
 	time_t last_spawn_time;
 	int retry_count;
@@ -89,6 +94,7 @@ int kmscon_pty_new(struct kmscon_pty **out, kmscon_pty_input_cb input_cb, void *
 
 	memset(pty, 0, sizeof(*pty));
 	pty->fd = -1;
+	pty->slave_fd = -1;
 	pty->ref = 1;
 	pty->input_cb = input_cb;
 	pty->last_spawn_time = time(NULL);
@@ -129,6 +135,14 @@ void kmscon_pty_unref(struct kmscon_pty *pty)
 
 	log_debug("free pty object");
 	kmscon_pty_close(pty);
+	if (pty->cuse) {
+		kmscon_cuse_free(pty->cuse);
+		pty->cuse = NULL;
+	}
+	if (pty->slave_fd >= 0) {
+		close(pty->slave_fd);
+		pty->slave_fd = -1;
+	}
 	free(pty->vtnr);
 	free(pty->seat);
 	free(pty->argv);
@@ -174,6 +188,14 @@ int kmscon_pty_set_conf(struct kmscon_pty *pty, const char *term, const char *co
 	if (argv && *argv && **argv)
 		return shl_dup_array(&pty->argv, argv);
 	return 0;
+}
+
+void kmscon_pty_set_cuse(struct kmscon_pty *pty, bool enable)
+{
+	if (!pty)
+		return;
+
+	pty->cuse_enabled = enable;
 }
 
 int kmscon_pty_get_fd(struct kmscon_pty *pty)
@@ -251,7 +273,8 @@ static void __attribute__((noreturn)) exec_child(const char *term, const char *c
 	exit(EXIT_FAILURE);
 }
 
-static void setup_child(int master, bool backspace_delete, struct winsize *ws)
+static void setup_child(int master, bool backspace_delete, struct winsize *ws,
+			const char *cuse_devname)
 {
 	int ret;
 	sigset_t sigset;
@@ -268,18 +291,6 @@ static void setup_child(int master, bool backspace_delete, struct winsize *ws)
 
 	for (i = 1; i < SIGSYS; ++i)
 		signal(i, SIG_DFL);
-
-	ret = grantpt(master);
-	if (ret < 0) {
-		log_err("grantpt failed: %m");
-		goto err_out;
-	}
-
-	ret = unlockpt(master);
-	if (ret < 0) {
-		log_err("cannot unlock pty: %m");
-		goto err_out;
-	}
 
 	ret = ptsname_r(master, slave_name, sizeof(slave_name));
 	if (ret) {
@@ -327,6 +338,29 @@ static void setup_child(int master, bool backspace_delete, struct winsize *ws)
 			log_warn("cannot set slave window size: %m");
 	}
 
+	/*
+	 * If a CUSE device is available, close the PTY slave (controlling
+	 * terminal is already established) and open the CUSE device for
+	 * stdin/stdout/stderr instead.  Fall back to the PTY slave on failure.
+	 */
+	if (cuse_devname) {
+		char cuse_path[64];
+		int cuse_fd;
+
+		snprintf(cuse_path, sizeof(cuse_path), "/dev/%s",
+			 cuse_devname);
+		cuse_fd = open(cuse_path, O_RDWR | O_CLOEXEC);
+		if (cuse_fd >= 0) {
+			log_debug("child: opened CUSE device %s fd=%d",
+				  cuse_path, cuse_fd);
+			close(slave);
+			slave = cuse_fd;
+		} else {
+			log_warn("cannot open CUSE device %s, "
+				 "falling back to PTY: %m", cuse_path);
+		}
+	}
+
 	if (dup2(slave, STDIN_FILENO) != STDIN_FILENO ||
 	    dup2(slave, STDOUT_FILENO) != STDOUT_FILENO ||
 	    dup2(slave, STDERR_FILENO) != STDERR_FILENO) {
@@ -356,6 +390,10 @@ static int pty_spawn(struct kmscon_pty *pty, int master, unsigned short width,
 {
 	pid_t pid;
 	struct winsize ws;
+	const char *cuse_devname = NULL;
+
+	if (pty->cuse)
+		cuse_devname = kmscon_cuse_get_devname(pty->cuse);
 
 	memset(&ws, 0, sizeof(ws));
 	ws.ws_col = width;
@@ -367,7 +405,7 @@ static int pty_spawn(struct kmscon_pty *pty, int master, unsigned short width,
 		log_err("cannot fork: %m");
 		return -errno;
 	case 0:
-		setup_child(master, pty->backspace_delete, &ws);
+		setup_child(master, pty->backspace_delete, &ws, cuse_devname);
 		exec_child(pty->term, pty->colorterm, pty->argv, pty->seat, pty->vtnr,
 			   pty->env_reset, drm);
 		exit(EXIT_FAILURE);
@@ -430,8 +468,9 @@ static int read_buf(struct kmscon_pty *pty)
 		}
 	} while (len > 0 && --num);
 
-	if (!num) {
-		log_debug("cannot read application data fast enough");
+	if (!num || len == 0 || (len < 0 && errno != EWOULDBLOCK)) {
+		if (!num)
+			log_debug("cannot read application data fast enough");
 
 		/* We are edge-triggered so update the mask to get the
 		 * EV_READABLE event again next round. */
@@ -447,6 +486,8 @@ static int read_buf(struct kmscon_pty *pty)
 static void pty_input(struct ev_fd *fd, int mask, void *data)
 {
 	struct kmscon_pty *pty = data;
+
+	log_debug("pty_input: mask=0x%x child=%d", mask, pty->child);
 
 	/* Programs like /bin/login tend to perform a vhangup() on their TTY
 	 * before running the login procedure. This also causes the pty master
@@ -466,8 +507,22 @@ static void pty_input(struct ev_fd *fd, int mask, void *data)
 
 	if (mask & EV_ERR)
 		log_warn("error on pty socket of child %d", pty->child);
-	if (mask & EV_HUP)
+	if (mask & EV_HUP) {
 		log_debug("HUP on pty of child %d", pty->child);
+
+		/*
+		 * Re-arm the edge-triggered interest after a HUP so we
+		 * catch data written once the slave is re-opened.
+		 * /bin/login calls vhangup() which revokes slave fds and
+		 * triggers EPOLLHUP on the master; after login re-opens
+		 * the slave and writes its prompt, EPOLLET needs a fresh
+		 * edge to fire.
+		 */
+		int m = EV_READABLE | EV_ET;
+		if (!shl_ring_is_empty(pty->msgbuf))
+			m |= EV_WRITEABLE;
+		ev_fd_update(pty->efd, m);
+	}
 	if (mask & EV_WRITEABLE)
 		send_buf(pty);
 	if (mask & EV_READABLE)
@@ -505,6 +560,8 @@ int kmscon_pty_open(struct kmscon_pty *pty, unsigned short width, unsigned short
 {
 	int ret;
 	int master;
+	char slave_name[128];
+	bool cuse_created = false;
 
 	if (!pty)
 		return -EINVAL;
@@ -518,9 +575,78 @@ int kmscon_pty_open(struct kmscon_pty *pty, unsigned short width, unsigned short
 		return -errno;
 	}
 
+	ret = grantpt(master);
+	if (ret < 0) {
+		log_err("grantpt failed: %m");
+		ret = -errno;
+		goto err_master;
+	}
+
+	ret = unlockpt(master);
+	if (ret < 0) {
+		log_err("cannot unlock pty: %m");
+		ret = -errno;
+		goto err_master;
+	}
+
+	ret = ptsname_r(master, slave_name, sizeof(slave_name));
+	if (ret) {
+		log_err("cannot find slave name: %m");
+		ret = -errno;
+		goto err_master;
+	}
+
+	if (pty->cuse_enabled && !pty->vtnr) {
+		log_notice("--cuse ignored: no real VT assigned");
+		pty->cuse_enabled = false;
+	}
+
+	if (pty->cuse_enabled) {
+		/*
+		 * Open the PTY slave in the parent so we can hand it to the
+		 * CUSE engine for proxying I/O.  O_NOCTTY prevents the parent
+		 * from acquiring it as controlling terminal; O_NONBLOCK is
+		 * needed because CUSE read/write handlers must not block.
+		 */
+		int new_slave = open(slave_name,
+				     O_RDWR | O_NONBLOCK | O_NOCTTY |
+					     O_CLOEXEC);
+		if (new_slave < 0) {
+			log_warn("cannot open slave for CUSE: %m");
+		} else if (pty->cuse) {
+			/*
+			 * CUSE device already exists from a previous session.
+			 * Swap to the new PTY slave without tearing down the
+			 * device -- avoids blocking kernel ops in the event
+			 * loop and keeps the /dev/ttyK<N> name stable.
+			 */
+			ret = kmscon_cuse_set_slave(pty->cuse, new_slave,
+						    slave_name);
+			if (ret) {
+				log_warn("cannot swap CUSE slave (%d)", ret);
+				close(new_slave);
+			} else {
+				pty->slave_fd = new_slave;
+			}
+		} else {
+			pty->slave_fd = new_slave;
+			ret = kmscon_cuse_new(&pty->cuse, pty->eloop,
+					      pty->slave_fd, slave_name,
+					      (unsigned)atoi(pty->vtnr));
+			if (ret) {
+				log_warn("cannot create CUSE device (%d), "
+					 "continuing without CUSE", ret);
+				close(pty->slave_fd);
+				pty->slave_fd = -1;
+			} else {
+				cuse_created = true;
+			}
+		}
+	}
+
 	ret = ev_eloop_new_fd(pty->eloop, &pty->efd, master, EV_ET | EV_READABLE, pty_input, pty);
 	if (ret)
-		goto err_master;
+		goto err_cuse;
 
 	ret = ev_eloop_register_child_cb(pty->eloop, sig_child, pty);
 	if (ret)
@@ -537,6 +663,13 @@ err_sig:
 err_fd:
 	ev_eloop_rm_fd(pty->efd);
 	pty->efd = NULL;
+err_cuse:
+	if (cuse_created) {
+		kmscon_cuse_free(pty->cuse);
+		pty->cuse = NULL;
+		close(pty->slave_fd);
+		pty->slave_fd = -1;
+	}
 err_master:
 	close(master);
 	return ret;
@@ -546,6 +679,18 @@ void kmscon_pty_close(struct kmscon_pty *pty)
 {
 	if (!pty || !pty_is_open(pty))
 		return;
+
+	/*
+	 * Keep the CUSE device and its slave_fd alive across child restarts
+	 * so /dev/ttyK<N> stays stable.  kmscon_cuse_set_slave() will swap
+	 * the slave fd on the next open; final cleanup happens in pty_free.
+	 */
+	if (!pty->cuse) {
+		if (pty->slave_fd >= 0) {
+			close(pty->slave_fd);
+			pty->slave_fd = -1;
+		}
+	}
 
 	ev_eloop_rm_fd(pty->efd);
 	pty->efd = NULL;
@@ -560,6 +705,8 @@ int kmscon_pty_write(struct kmscon_pty *pty, const char *u8, size_t len)
 
 	if (!pty || !pty_is_open(pty) || !u8 || !len)
 		return -EINVAL;
+
+	log_debug("pty_write: %zu bytes to master fd=%d", len, pty->fd);
 
 	if (!shl_ring_is_empty(pty->msgbuf))
 		goto buf;

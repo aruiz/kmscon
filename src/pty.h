@@ -55,6 +55,7 @@ void kmscon_pty_unref(struct kmscon_pty *pty);
 int kmscon_pty_set_conf(struct kmscon_pty *pty, const char *term, const char *colorterm,
 			char **argv, const char *seat, unsigned int vtnr, bool do_reset,
 			bool backspace);
+void kmscon_pty_set_cuse(struct kmscon_pty *pty, bool enable);
 
 int kmscon_pty_get_fd(struct kmscon_pty *pty);
 void kmscon_pty_dispatch(struct kmscon_pty *pty);

@@ -922,6 +922,8 @@ int kmscon_terminal_register(struct kmscon_session **out, struct kmscon_seat *se
 	if (ret)
 		goto err_pty;
 
+	kmscon_pty_set_cuse(term->pty, term->conf->cuse);
+
 	ret = ev_eloop_new_fd(term->eloop, &term->ptyfd, kmscon_pty_get_fd(term->pty), EV_READABLE,
 			      pty_event, term);
 	if (ret)
