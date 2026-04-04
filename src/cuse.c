@@ -50,6 +50,10 @@
 
 #define CUSE_READ_BUFFER (FUSE_MIN_READ_BUFFER + 4096)
 
+#define NLONGS(n) (((n) + LONG_BIT - 1) / LONG_BIT)
+#define BIT_IS_SET(array, bit) \
+	(!!((array)[(bit) / LONG_BIT] & (1UL << ((bit) % LONG_BIT))))
+
 /*
  * We need the *kernel's* struct termios size for FUSE ioctl retry iovecs.
  * glibc's <termios.h> defines a larger struct (NCCS=32, plus c_ispeed and
@@ -62,10 +66,6 @@
  * that glibc's tcgetattr/tcsetattr allocate, smashing the stack canary.
  */
 #include <asm/termbits.h>
-
-#define NLONGS(n) (((n) + LONG_BIT - 1) / LONG_BIT)
-#define BIT_IS_SET(array, bit) \
-	(!!((array)[(bit) / LONG_BIT] & (1UL << ((bit) % LONG_BIT))))
 
 struct kmscon_cuse {
 	int cuse_fd;
@@ -98,6 +98,8 @@ struct kmscon_cuse {
 
 	unsigned int vtnr;
 	struct vt_mode vtmode;
+
+	char *func_strings[256];
 
 	char slave_path[128];
 };
@@ -653,7 +655,54 @@ static void handle_ioctl(struct kmscon_cuse *cuse,
 		cuse->kb_mode = (int)in->arg;
 		cuse_reply_ioctl(cuse, hdr->unique, 0, NULL, 0);
 		return;
+	case KDGKBSENT: {
+		struct kbsentry kbs;
 
+		if (in->in_size < sizeof(kbs) || in->out_size < sizeof(kbs)) {
+			struct fuse_ioctl_iovec fiov = {
+				.base = in->arg,
+				.len = sizeof(kbs),
+			};
+			cuse_reply_ioctl_retry(cuse, hdr->unique,
+					       &fiov, 1, &fiov, 1);
+		} else {
+			const struct kbsentry *req = (const void *)
+				(cuse->buf + sizeof(struct fuse_in_header) +
+				 sizeof(struct fuse_ioctl_in));
+
+			memset(&kbs, 0, sizeof(kbs));
+			kbs.kb_func = req->kb_func;
+			if (cuse->func_strings[req->kb_func])
+				strncpy((char *)kbs.kb_string,
+					cuse->func_strings[req->kb_func],
+					sizeof(kbs.kb_string) - 1);
+			cuse_reply_ioctl(cuse, hdr->unique, 0,
+					 &kbs, sizeof(kbs));
+		}
+		return;
+	}
+	case KDSKBSENT: {
+		if (in->in_size < sizeof(struct kbsentry)) {
+			struct fuse_ioctl_iovec fiov = {
+				.base = in->arg,
+				.len = sizeof(struct kbsentry),
+			};
+			cuse_reply_ioctl_retry(cuse, hdr->unique,
+					       &fiov, 1, NULL, 0);
+		} else {
+			const struct kbsentry *req = (const void *)
+				(cuse->buf + sizeof(struct fuse_in_header) +
+				 sizeof(struct fuse_ioctl_in));
+			unsigned char idx = req->kb_func;
+
+			free(cuse->func_strings[idx]);
+			cuse->func_strings[idx] = strndup(
+				(const char *)req->kb_string,
+				sizeof(req->kb_string) - 1);
+			cuse_reply_ioctl(cuse, hdr->unique, 0, NULL, 0);
+		}
+		return;
+	}
 	/*
 	 * VT management ioctls.  kmscon owns the real VT underneath,
 	 * so we present a self-consistent view to programs running
@@ -1171,8 +1220,8 @@ fail:
  * with the event loop.
  *
  * The device is named ttyK<vtnr> to mirror the VT it serves.  If the
- * kernel rejects that name due to a stale sysfs entry left by a
- * previous CUSE session, we retry with a PID-qualified fallback.
+ * kernel rejects that name (stale sysfs entry from a leaked device --
+ * see CUSE_KERNEL_BUG.md), we retry with a PID-qualified fallback.
  */
 
 int kmscon_cuse_new(struct kmscon_cuse **out, struct ev_eloop *eloop,
@@ -1201,14 +1250,29 @@ int kmscon_cuse_new(struct kmscon_cuse **out, struct ev_eloop *eloop,
 		snprintf(cuse->slave_path, sizeof(cuse->slave_path),
 			 "%s", slave_path);
 
+	static const struct { unsigned char idx; const char *str; } fkey_defaults[] = {
+		{  0, "\033[[A"  }, {  1, "\033[[B"  }, {  2, "\033[[C"  },
+		{  3, "\033[[D"  }, {  4, "\033[[E"  }, {  5, "\033[17~" },
+		{  6, "\033[18~" }, {  7, "\033[19~" }, {  8, "\033[20~" },
+		{  9, "\033[21~" }, { 10, "\033[23~" }, { 11, "\033[24~" },
+		{ 12, "\033[25~" }, { 13, "\033[26~" }, { 14, "\033[28~" },
+		{ 15, "\033[29~" }, { 16, "\033[31~" }, { 17, "\033[32~" },
+		{ 18, "\033[33~" }, { 19, "\033[34~" },
+		{ 20, "\033[1~"  }, { 21, "\033[2~"  }, { 22, "\033[3~"  },
+		{ 23, "\033[4~"  }, { 24, "\033[5~"  }, { 25, "\033[6~"  },
+	};
+	for (size_t i = 0; i < sizeof(fkey_defaults) / sizeof(fkey_defaults[0]); i++)
+		cuse->func_strings[fkey_defaults[i].idx] =
+			strdup(fkey_defaults[i].str);
+
 	snprintf(cuse->devname, sizeof(cuse->devname), "ttyK%u", vtnr);
 
 	ret = cuse_handshake(cuse);
 	if (ret == -ENODEV) {
 		/*
-		 * The kernel rejected the device name, likely due to a
-		 * stale sysfs entry left by a previous CUSE session.
-		 * Retry with a PID-qualified fallback name.
+		 * The clean name is poisoned by a stale sysfs entry
+		 * (kernel bug in cuse_process_init_reply -- see
+		 * CUSE_KERNEL_BUG.md).  Retry with a unique fallback.
 		 */
 		log_warn("CUSE device name %s rejected (stale sysfs "
 			 "entry?), retrying with fallback name",
@@ -1293,6 +1357,8 @@ void kmscon_cuse_free(struct kmscon_cuse *cuse)
 		ev_eloop_rm_fd(cuse->efd);
 	if (cuse->cuse_fd >= 0)
 		close(cuse->cuse_fd);
+	for (int i = 0; i < 256; i++)
+		free(cuse->func_strings[i]);
 	if (cuse->eloop)
 		ev_eloop_unref(cuse->eloop);
 	free(cuse);
