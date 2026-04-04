@@ -30,6 +30,7 @@
 #include <linux/fuse.h>
 #include <linux/input.h>
 #include <linux/kd.h>
+#include <linux/vt.h>
 #include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -96,6 +97,7 @@ struct kmscon_cuse {
 	int kd_mode;
 
 	unsigned int vtnr;
+	struct vt_mode vtmode;
 
 	char slave_path[128];
 };
@@ -651,6 +653,99 @@ static void handle_ioctl(struct kmscon_cuse *cuse,
 		cuse->kb_mode = (int)in->arg;
 		cuse_reply_ioctl(cuse, hdr->unique, 0, NULL, 0);
 		return;
+
+	/*
+	 * VT management ioctls.  kmscon owns the real VT underneath,
+	 * so we present a self-consistent view to programs running
+	 * inside the CUSE terminal.
+	 */
+	case VT_GETSTATE: {
+		struct vt_stat vs;
+
+		if (in->out_size < sizeof(vs)) {
+			struct fuse_ioctl_iovec fiov = {
+				.base = in->arg,
+				.len = sizeof(vs),
+			};
+			cuse_reply_ioctl_retry(cuse, hdr->unique,
+					       NULL, 0, &fiov, 1);
+		} else {
+			memset(&vs, 0, sizeof(vs));
+			vs.v_active = cuse->vtnr;
+			vs.v_state = 1 << cuse->vtnr;
+			cuse_reply_ioctl(cuse, hdr->unique, 0,
+					 &vs, sizeof(vs));
+		}
+		return;
+	}
+	case VT_OPENQRY: {
+		/*
+		 * Report no free VT.  kmscon manages VTs itself;
+		 * child processes should not allocate new ones.
+		 */
+		int vt = -1;
+
+		if (in->out_size < sizeof(vt)) {
+			struct fuse_ioctl_iovec fiov = {
+				.base = in->arg,
+				.len = sizeof(vt),
+			};
+			cuse_reply_ioctl_retry(cuse, hdr->unique,
+					       NULL, 0, &fiov, 1);
+		} else {
+			cuse_reply_ioctl(cuse, hdr->unique, 0,
+					 &vt, sizeof(vt));
+		}
+		return;
+	}
+	case VT_GETMODE: {
+		if (in->out_size < sizeof(struct vt_mode)) {
+			struct fuse_ioctl_iovec fiov = {
+				.base = in->arg,
+				.len = sizeof(struct vt_mode),
+			};
+			cuse_reply_ioctl_retry(cuse, hdr->unique,
+					       NULL, 0, &fiov, 1);
+		} else {
+			cuse_reply_ioctl(cuse, hdr->unique, 0,
+					 &cuse->vtmode,
+					 sizeof(cuse->vtmode));
+		}
+		return;
+	}
+	case VT_SETMODE: {
+		if (in->in_size < sizeof(struct vt_mode)) {
+			struct fuse_ioctl_iovec fiov = {
+				.base = in->arg,
+				.len = sizeof(struct vt_mode),
+			};
+			cuse_reply_ioctl_retry(cuse, hdr->unique,
+					       &fiov, 1, NULL, 0);
+		} else {
+			const void *data = cuse->buf +
+				sizeof(struct fuse_in_header) +
+				sizeof(struct fuse_ioctl_in);
+
+			memcpy(&cuse->vtmode, data,
+			       sizeof(cuse->vtmode));
+			cuse_reply_ioctl(cuse, hdr->unique, 0,
+					 NULL, 0);
+		}
+		return;
+	}
+	case VT_ACTIVATE:
+	case VT_WAITACTIVE:
+		/* Silently succeed -- kmscon controls VT switching. */
+		cuse_reply_ioctl(cuse, hdr->unique, 0, NULL, 0);
+		return;
+	case VT_RELDISP:
+		/*
+		 * Acknowledge the VT release/acquire.  In VT_PROCESS
+		 * mode the kernel expects this; we always succeed.
+		 */
+		cuse_reply_ioctl(cuse, hdr->unique, 0, NULL, 0);
+		return;
+
 	/*
 	 * TIOCGPGRP and TIOCSPGRP check that the fd is the caller's
 	 * controlling terminal.  Since the daemon's ctty is not the
@@ -1100,6 +1195,7 @@ int kmscon_cuse_new(struct kmscon_cuse **out, struct ev_eloop *eloop,
 	cuse->kb_mode = K_UNICODE;
 	cuse->kd_mode = KD_TEXT;
 	cuse->vtnr = vtnr;
+	cuse->vtmode.mode = VT_AUTO;
 	cuse->slave_fd = slave_fd;
 	if (slave_path)
 		snprintf(cuse->slave_path, sizeof(cuse->slave_path),
@@ -1245,7 +1341,11 @@ int kmscon_cuse_set_slave(struct kmscon_cuse *cuse, int new_slave_fd,
 	}
 
 	cuse->fg_pgrp = 0;
+	cuse->kd_mode = KD_TEXT;
+	cuse->kb_mode = K_UNICODE;
 	cuse->open_count = 0;
+	memset(&cuse->vtmode, 0, sizeof(cuse->vtmode));
+	cuse->vtmode.mode = VT_AUTO;
 
 	update_slave_monitoring(cuse);
 
