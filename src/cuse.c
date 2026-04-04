@@ -23,9 +23,13 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <linux/fuse.h>
+#include <linux/input.h>
+#include <linux/kd.h>
 #include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -58,6 +62,10 @@
  */
 #include <asm/termbits.h>
 
+#define NLONGS(n) (((n) + LONG_BIT - 1) / LONG_BIT)
+#define BIT_IS_SET(array, bit) \
+	(!!((array)[(bit) / LONG_BIT] & (1UL << ((bit) % LONG_BIT))))
+
 struct kmscon_cuse {
 	int cuse_fd;
 	int slave_fd;
@@ -77,6 +85,13 @@ struct kmscon_cuse {
 	bool poll_registered;
 
 	pid_t fg_pgrp;
+
+	int spkr_fd;
+	struct ev_timer *tone_timer;
+
+	int kbd_fd;
+	unsigned char led_state;
+	unsigned char kbd_flags;
 
 	unsigned int vtnr;
 
@@ -313,19 +328,14 @@ static void handle_write(struct kmscon_cuse *cuse,
 	n = write(cuse->slave_fd, data, in->size);
 	if (n < 0 && errno == EIO && cuse_reopen_slave(cuse) == 0)
 		n = write(cuse->slave_fd, data, in->size);
-	if (n < 0) {
-		if (errno == EAGAIN || errno == EWOULDBLOCK) {
-			memset(&out, 0, sizeof(out));
-			out.size = 0;
-			cuse_reply_buf(cuse, hdr->unique, &out, sizeof(out));
-		} else {
-			cuse_reply_err(cuse, hdr->unique, errno);
-		}
+	if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+		cuse_reply_err(cuse, hdr->unique, errno);
 		return;
 	}
 
 	memset(&out, 0, sizeof(out));
-	out.size = n;
+	if (n > 0)
+		out.size = n;
 	cuse_reply_buf(cuse, hdr->unique, &out, sizeof(out));
 }
 
@@ -373,6 +383,179 @@ static struct ioctl_info classify_ioctl(unsigned int cmd)
 	}
 }
 
+/*
+ * Find an evdev device that advertises a specific capability bit.
+ * Used to locate the PC speaker (EV_SND + SND_TONE) and a keyboard
+ * with LEDs (EV_LED + LED_NUML).
+ */
+static int find_evdev(unsigned int cap_type, unsigned int cap_bit)
+{
+	DIR *dir;
+	struct dirent *ent;
+	char path[PATH_MAX];
+	int fd;
+	unsigned long evbits[NLONGS(EV_CNT)] = { 0 };
+	unsigned long capbits[NLONGS(SND_MAX + 1)] = { 0 };
+
+	dir = opendir("/dev/input");
+	if (!dir)
+		return -1;
+
+	while ((ent = readdir(dir))) {
+		if (strncmp(ent->d_name, "event", 5))
+			continue;
+
+		snprintf(path, sizeof(path), "/dev/input/%s", ent->d_name);
+		fd = open(path, O_WRONLY | O_CLOEXEC);
+		if (fd < 0)
+			continue;
+
+		memset(evbits, 0, sizeof(evbits));
+		if (ioctl(fd, EVIOCGBIT(0, sizeof(evbits)), evbits) < 0 ||
+		    !BIT_IS_SET(evbits, cap_type)) {
+			close(fd);
+			continue;
+		}
+
+		memset(capbits, 0, sizeof(capbits));
+		if (ioctl(fd, EVIOCGBIT(cap_type, sizeof(capbits)),
+			  capbits) < 0 ||
+		    !BIT_IS_SET(capbits, cap_bit)) {
+			close(fd);
+			continue;
+		}
+
+		closedir(dir);
+		return fd;
+	}
+
+	closedir(dir);
+	return -1;
+}
+
+static void spkr_tone(struct kmscon_cuse *cuse, unsigned int hz)
+{
+	struct input_event ev;
+
+	if (cuse->spkr_fd < 0)
+		return;
+
+	memset(&ev, 0, sizeof(ev));
+	ev.type = EV_SND;
+	ev.code = SND_TONE;
+	ev.value = hz;
+
+	if (write(cuse->spkr_fd, &ev, sizeof(ev)) < 0)
+		log_debug("spkr_tone(%u): write failed: %m", hz);
+}
+
+static void tone_timeout(struct ev_timer *timer, uint64_t num, void *data)
+{
+	struct kmscon_cuse *cuse = data;
+
+	spkr_tone(cuse, 0);
+	ev_timer_disable(timer);
+}
+
+static void sync_leds(struct kmscon_cuse *cuse)
+{
+	struct input_event ev[3];
+
+	if (cuse->kbd_fd < 0)
+		return;
+
+	memset(ev, 0, sizeof(ev));
+	ev[0].type = EV_LED;
+	ev[0].code = LED_SCROLLL;
+	ev[0].value = !!(cuse->led_state & LED_SCR);
+	ev[1].type = EV_LED;
+	ev[1].code = LED_NUML;
+	ev[1].value = !!(cuse->led_state & LED_NUM);
+	ev[2].type = EV_LED;
+	ev[2].code = LED_CAPSL;
+	ev[2].value = !!(cuse->led_state & LED_CAP);
+
+	if (write(cuse->kbd_fd, ev, sizeof(ev)) < 0)
+		log_debug("sync_leds: write failed: %m");
+}
+
+static void handle_ioctl_kiocsound(struct kmscon_cuse *cuse, uint64_t unique,
+				   unsigned long arg)
+{
+	unsigned int hz = arg ? (unsigned)(1193182UL / arg) : 0;
+
+	if (cuse->tone_timer)
+		ev_timer_disable(cuse->tone_timer);
+
+	spkr_tone(cuse, hz);
+	log_debug("KIOCSOUND: %s", hz ? "on" : "off");
+
+	cuse_reply_ioctl(cuse, unique, 0, NULL, 0);
+}
+
+static void handle_ioctl_kdmktone(struct kmscon_cuse *cuse, uint64_t unique,
+				  unsigned long arg)
+{
+	unsigned int count = arg & 0xffff;
+	unsigned int ms = (arg >> 16) & 0xffff;
+	unsigned int hz = count ? (unsigned)(1193182UL / count) : 0;
+
+	if (cuse->tone_timer)
+		ev_timer_disable(cuse->tone_timer);
+
+	spkr_tone(cuse, hz);
+
+	if (hz && ms && cuse->tone_timer) {
+		struct itimerspec spec;
+
+		memset(&spec, 0, sizeof(spec));
+		spec.it_value.tv_sec = ms / 1000;
+		spec.it_value.tv_nsec = (ms % 1000) * 1000000L;
+		ev_timer_update(cuse->tone_timer, &spec);
+	}
+
+	log_debug("KDMKTONE: %u Hz, %u ms", hz, ms);
+	cuse_reply_ioctl(cuse, unique, 0, NULL, 0);
+}
+
+/*
+ * Ioctl helpers -- factor out the retry-or-reply dance for returning
+ * a fixed value to userspace and for fetching pointer input.
+ */
+
+static void ioctl_read_val(struct kmscon_cuse *cuse,
+			   const struct fuse_in_header *hdr,
+			   const struct fuse_ioctl_in *in,
+			   const void *val, size_t size)
+{
+	if (in->out_size < size) {
+		struct fuse_ioctl_iovec fiov = {
+			.base = in->arg,
+			.len = size,
+		};
+		cuse_reply_ioctl_retry(cuse, hdr->unique,
+				       NULL, 0, &fiov, 1);
+	} else {
+		cuse_reply_ioctl(cuse, hdr->unique, 0, val, size);
+	}
+}
+
+static const void *ioctl_fetch_input(struct kmscon_cuse *cuse,
+				     const struct fuse_in_header *hdr,
+				     const struct fuse_ioctl_in *in,
+				     size_t size)
+{
+	if (in->in_size >= size)
+		return (const char *)in + sizeof(*in);
+
+	struct fuse_ioctl_iovec fiov = {
+		.base = in->arg,
+		.len = size,
+	};
+	cuse_reply_ioctl_retry(cuse, hdr->unique, &fiov, 1, NULL, 0);
+	return NULL;
+}
+
 static void handle_ioctl(struct kmscon_cuse *cuse,
 			 const struct fuse_in_header *hdr,
 			 const void *payload)
@@ -382,6 +565,33 @@ static void handle_ioctl(struct kmscon_cuse *cuse,
 	int ret;
 
 	switch (in->cmd) {
+	case KIOCSOUND:
+		handle_ioctl_kiocsound(cuse, hdr->unique,
+				       (unsigned long)in->arg);
+		return;
+	case KDMKTONE:
+		handle_ioctl_kdmktone(cuse, hdr->unique,
+				      (unsigned long)in->arg);
+		return;
+	case KDGETLED: {
+		unsigned char val = cuse->led_state;
+		ioctl_read_val(cuse, hdr, in, &val, sizeof(val));
+		return;
+	}
+	case KDSETLED:
+		cuse->led_state = (unsigned char)in->arg & 0x07;
+		sync_leds(cuse);
+		cuse_reply_ioctl(cuse, hdr->unique, 0, NULL, 0);
+		return;
+	case KDGKBLED: {
+		unsigned char val = cuse->kbd_flags;
+		ioctl_read_val(cuse, hdr, in, &val, sizeof(val));
+		return;
+	}
+	case KDSKBLED:
+		cuse->kbd_flags = (unsigned char)in->arg & 0x77;
+		cuse_reply_ioctl(cuse, hdr->unique, 0, NULL, 0);
+		return;
 	/*
 	 * TIOCGPGRP and TIOCSPGRP check that the fd is the caller's
 	 * controlling terminal.  Since the daemon's ctty is not the
@@ -389,39 +599,20 @@ static void handle_ioctl(struct kmscon_cuse *cuse,
 	 */
 	case TIOCGPGRP: {
 		pid_t pgrp = cuse->fg_pgrp;
-
-		if (in->out_size < sizeof(pid_t)) {
-			struct fuse_ioctl_iovec fiov = {
-				.base = in->arg,
-				.len = sizeof(pid_t),
-			};
-			cuse_reply_ioctl_retry(cuse, hdr->unique,
-					       NULL, 0, &fiov, 1);
-		} else {
-			cuse_reply_ioctl(cuse, hdr->unique, 0,
-					 &pgrp, sizeof(pgrp));
-		}
+		ioctl_read_val(cuse, hdr, in, &pgrp, sizeof(pgrp));
 		return;
 	}
 	case TIOCSPGRP: {
-		if (in->in_size < sizeof(pid_t)) {
-			struct fuse_ioctl_iovec fiov = {
-				.base = in->arg,
-				.len = sizeof(pid_t),
-			};
-			cuse_reply_ioctl_retry(cuse, hdr->unique,
-					       &fiov, 1, NULL, 0);
-		} else {
-			const void *data = cuse->buf +
-				sizeof(struct fuse_in_header) +
-				sizeof(struct fuse_ioctl_in);
-			pid_t pgrp;
+		const void *data = ioctl_fetch_input(cuse, hdr, in,
+						     sizeof(pid_t));
+		pid_t pgrp;
 
-			memcpy(&pgrp, data, sizeof(pgrp));
-			cuse->fg_pgrp = pgrp;
-			log_debug("TIOCSPGRP: fg_pgrp=%d", (int)pgrp);
-			cuse_reply_ioctl(cuse, hdr->unique, 0, NULL, 0);
-		}
+		if (!data)
+			return;
+		memcpy(&pgrp, data, sizeof(pgrp));
+		cuse->fg_pgrp = pgrp;
+		log_debug("TIOCSPGRP: fg_pgrp=%d", (int)pgrp);
+		cuse_reply_ioctl(cuse, hdr->unique, 0, NULL, 0);
 		return;
 	}
 	}
@@ -446,31 +637,25 @@ static void handle_ioctl(struct kmscon_cuse *cuse,
 			cuse_reply_ioctl(cuse, hdr->unique, ret, NULL, 0);
 		break;
 
-	case IOCTL_DIR_WRITE:
-		if (in->in_size < info.size) {
-			struct fuse_ioctl_iovec fiov = {
-				.base = in->arg,
-				.len = info.size,
-			};
-			cuse_reply_ioctl_retry(cuse, hdr->unique,
-					       &fiov, 1, NULL, 0);
-		} else {
-			const void *arg = cuse->buf +
-					  sizeof(struct fuse_in_header) +
-					  sizeof(struct fuse_ioctl_in);
+	case IOCTL_DIR_WRITE: {
+		const void *arg = ioctl_fetch_input(cuse, hdr, in,
+						    info.size);
+		if (!arg)
+			break;
+		ret = ioctl(cuse->slave_fd, in->cmd, arg);
+		if (ret < 0 && errno == EIO &&
+		    cuse_reopen_slave(cuse) == 0)
 			ret = ioctl(cuse->slave_fd, in->cmd, arg);
-			if (ret < 0 && errno == EIO &&
-			    cuse_reopen_slave(cuse) == 0)
-				ret = ioctl(cuse->slave_fd, in->cmd, arg);
-			if (ret < 0)
-				cuse_reply_err(cuse, hdr->unique, errno);
-			else
-				cuse_reply_ioctl(cuse, hdr->unique, ret,
-						 NULL, 0);
-		}
+		if (ret < 0)
+			cuse_reply_err(cuse, hdr->unique, errno);
+		else
+			cuse_reply_ioctl(cuse, hdr->unique, ret, NULL, 0);
 		break;
+	}
 
 	case IOCTL_DIR_READ: {
+		char out_data[256];
+
 		if (in->out_size < info.size) {
 			struct fuse_ioctl_iovec fiov = {
 				.base = in->arg,
@@ -478,18 +663,17 @@ static void handle_ioctl(struct kmscon_cuse *cuse,
 			};
 			cuse_reply_ioctl_retry(cuse, hdr->unique,
 					       NULL, 0, &fiov, 1);
-		} else {
-			char out_data[256];
-			ret = ioctl(cuse->slave_fd, in->cmd, out_data);
-			if (ret < 0 && errno == EIO &&
-			    cuse_reopen_slave(cuse) == 0)
-				ret = ioctl(cuse->slave_fd, in->cmd, out_data);
-			if (ret < 0)
-				cuse_reply_err(cuse, hdr->unique, errno);
-			else
-				cuse_reply_ioctl(cuse, hdr->unique, ret,
-						 out_data, info.size);
+			break;
 		}
+		ret = ioctl(cuse->slave_fd, in->cmd, out_data);
+		if (ret < 0 && errno == EIO &&
+		    cuse_reopen_slave(cuse) == 0)
+			ret = ioctl(cuse->slave_fd, in->cmd, out_data);
+		if (ret < 0)
+			cuse_reply_err(cuse, hdr->unique, errno);
+		else
+			cuse_reply_ioctl(cuse, hdr->unique, ret,
+					 out_data, info.size);
 		break;
 	}
 
@@ -852,6 +1036,8 @@ int kmscon_cuse_new(struct kmscon_cuse **out, struct ev_eloop *eloop,
 		return -ENOMEM;
 
 	cuse->cuse_fd = -1;
+	cuse->spkr_fd = -1;
+	cuse->kbd_fd = -1;
 	cuse->vtnr = vtnr;
 	cuse->slave_fd = slave_fd;
 	if (slave_path)
@@ -900,6 +1086,19 @@ int kmscon_cuse_new(struct kmscon_cuse **out, struct ev_eloop *eloop,
 		goto err_cuse_efd;
 	}
 
+	cuse->spkr_fd = find_evdev(EV_SND, SND_TONE);
+	if (cuse->spkr_fd >= 0) {
+		ret = ev_eloop_new_timer(eloop, &cuse->tone_timer, NULL,
+					 tone_timeout, cuse);
+		if (ret) {
+			log_warn("cannot create tone timer: %d", ret);
+			close(cuse->spkr_fd);
+			cuse->spkr_fd = -1;
+		}
+	}
+
+	cuse->kbd_fd = find_evdev(EV_LED, LED_NUML);
+
 	*out = cuse;
 	return 0;
 
@@ -922,6 +1121,15 @@ void kmscon_cuse_free(struct kmscon_cuse *cuse)
 
 	log_info("destroying CUSE device %s", cuse->devname);
 
+	if (cuse->tone_timer) {
+		spkr_tone(cuse, 0);
+		ev_eloop_rm_timer(cuse->tone_timer);
+		ev_timer_unref(cuse->tone_timer);
+	}
+	if (cuse->spkr_fd >= 0)
+		close(cuse->spkr_fd);
+	if (cuse->kbd_fd >= 0)
+		close(cuse->kbd_fd);
 	if (cuse->slave_efd)
 		ev_eloop_rm_fd(cuse->slave_efd);
 	if (cuse->efd)
