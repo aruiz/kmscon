@@ -57,6 +57,7 @@ struct kmscon_pty {
 	int fd;
 	pid_t child;
 	struct ev_fd *efd;
+	struct ev_timer *hup_timer;
 	struct shl_ring *msgbuf;
 	char io_buf[KMSCON_NREAD];
 
@@ -444,6 +445,52 @@ static int read_buf(struct kmscon_pty *pty)
 	return 0;
 }
 
+/*
+ * /bin/login calls vhangup() which revokes all slave fds and triggers
+ * EPOLLHUP on the master.  Because the master uses edge-triggered epoll,
+ * this HUP consumes the edge; when login later re-opens the slave and
+ * writes its "hostname login:" prompt, no new EPOLLIN edge fires and
+ * the prompt data sits unread — the user sees a blank screen.
+ *
+ * We cannot simply re-arm immediately on HUP because while the slave is
+ * still closed EPOLLHUP keeps firing, creating a CPU-burning busy loop.
+ * Instead we start a short one-shot timer; by the time it fires login
+ * has had time to re-open the slave and write its prompt.  The timer
+ * callback re-arms the master fd's edge trigger so the pending EPOLLIN
+ * (or the next state change) is delivered normally.
+ */
+static void pty_hup_timeout(struct ev_timer *timer, uint64_t num, void *data)
+{
+	struct kmscon_pty *pty = data;
+	int m;
+
+	if (!pty_is_open(pty))
+		return;
+
+	log_debug("hup timer fired for child %d, re-arming master",
+		  pty->child);
+
+	m = EV_READABLE | EV_ET;
+	if (!shl_ring_is_empty(pty->msgbuf))
+		m |= EV_WRITEABLE;
+	ev_fd_update(pty->efd, m);
+
+	read_buf(pty);
+}
+
+static void pty_arm_hup_timer(struct kmscon_pty *pty)
+{
+	struct itimerspec spec;
+
+	if (!pty->hup_timer)
+		return;
+
+	memset(&spec, 0, sizeof(spec));
+	spec.it_value.tv_nsec = 150 * 1000 * 1000; /* 150 ms one-shot */
+
+	ev_timer_update(pty->hup_timer, &spec);
+}
+
 static void pty_input(struct ev_fd *fd, int mask, void *data)
 {
 	struct kmscon_pty *pty = data;
@@ -466,8 +513,10 @@ static void pty_input(struct ev_fd *fd, int mask, void *data)
 
 	if (mask & EV_ERR)
 		log_warn("error on pty socket of child %d", pty->child);
-	if (mask & EV_HUP)
+	if (mask & EV_HUP) {
 		log_debug("HUP on pty of child %d", pty->child);
+		pty_arm_hup_timer(pty);
+	}
 	if (mask & EV_WRITEABLE)
 		send_buf(pty);
 	if (mask & EV_READABLE)
@@ -522,6 +571,15 @@ int kmscon_pty_open(struct kmscon_pty *pty, unsigned short width, unsigned short
 	if (ret)
 		goto err_master;
 
+	if (!pty->hup_timer) {
+		struct itimerspec zero;
+		memset(&zero, 0, sizeof(zero));
+		ret = ev_eloop_new_timer(pty->eloop, &pty->hup_timer,
+					 &zero, pty_hup_timeout, pty);
+		if (ret)
+			log_warn("cannot create hup timer (%d)", ret);
+	}
+
 	ret = ev_eloop_register_child_cb(pty->eloop, sig_child, pty);
 	if (ret)
 		goto err_fd;
@@ -546,6 +604,12 @@ void kmscon_pty_close(struct kmscon_pty *pty)
 {
 	if (!pty || !pty_is_open(pty))
 		return;
+
+	if (pty->hup_timer) {
+		ev_eloop_rm_timer(pty->hup_timer);
+		ev_timer_unref(pty->hup_timer);
+		pty->hup_timer = NULL;
+	}
 
 	ev_eloop_rm_fd(pty->efd);
 	pty->efd = NULL;
