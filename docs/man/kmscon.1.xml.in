@@ -45,7 +45,7 @@
       <command>kmscon <arg choice="opt" rep="repeat">OPTIONS</arg></command>
     </cmdsynopsis>
     <cmdsynopsis>
-      <command>kmscon -l <arg choice="opt" rep="repeat">OPTIONS</arg> -- /bin/login <arg choice="opt" rep="repeat">/bin/login-OPTIONS</arg></command>
+      <command>kmscon -e <arg choice="opt" rep="repeat">OPTIONS</arg> -- <arg>command</arg> <arg choice="opt" rep="repeat">arguments</arg></command>
     </cmdsynopsis>
   </refsynopsisdiv>
 
@@ -217,24 +217,24 @@
 
     <variablelist>
       <varlistentry>
-        <term><option>-l</option></term>
-        <term><option>--login</option></term>
+        <term><option>-e</option></term>
+        <term><option>--command</option></term>
         <listitem>
-          <para>Specify the application that is started on new terminal
-                sessions. This takes no argument but instead everything left
-                after all options have been parsed is used as argument to this
-                option. Note that nothing after two dashes <option>--</option>
-                is parsed as regular option by kmscon.
+          <para>Run a custom command as the session program instead of the
+                default /bin/login -p. Everything after <option>--</option>
+                is passed as the command and its arguments. Note that nothing
+                after two dashes <option>--</option> is parsed as a regular
+                option by kmscon.
                 (default: /bin/login -p)</para>
 
-          <para>If this option is specified in the configuration file, the
-                argument is split into words using the rules of the POSIX shell.
-                It is possible to include whitespace in arguments by enclosing
-                the argument in double or single quotes or by prepending it with
-                a backslash.</para>
+          <para>If this option is specified in the configuration file (as
+                <option>command</option>), the argument is split into words
+                using the rules of the POSIX shell. It is possible to include
+                whitespace in arguments by enclosing the argument in double or
+                single quotes or by prepending it with a backslash.</para>
 
           <para>This example starts '/bin/bash -i' on each new terminal session:
-                ./kmscon --login --debug --no-switchvt -- /bin/bash -i</para>
+                ./kmscon --command --debug --no-switchvt -- /bin/bash -i</para>
         </listitem>
       </varlistentry>
 
@@ -822,7 +822,7 @@
     <programlisting>
       font-name=Meslo LG M
       font-size=14
-      login=/bin/bash -i
+      command=/bin/bash -i
       palette-foreground=255, 0, 0
     </programlisting>
 
@@ -855,7 +855,7 @@
           <citerefentry><refentrytitle>login</refentrytitle><manvolnum>1</manvolnum></citerefentry>
           on each new terminal. After a session exits, KMSCON automatically
           respawns the next session. You can change the program that is spawned
-          with the <option>--login</option> option. To stop kmscon, send SIGTERM
+          with the <option>--command</option> option. To stop kmscon, send SIGTERM
           to the KMSCON process.</para>
 
     <para>Keyboard input is done by <emphasis>libxkbcommon</emphasis>. This

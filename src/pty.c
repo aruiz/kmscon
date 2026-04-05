@@ -485,7 +485,7 @@ static void sig_child(struct ev_eloop *eloop, struct ev_child_data *chld, void *
 	log_info("child exited: pid: %u status: %d", chld->pid, chld->status);
 
 	if (pty->retry_count == MAX_RETRY_COUNT) {
-		log_err("reached max retry attempts for login process");
+		log_err("reached max retry attempts for session command");
 		return;
 	}
 

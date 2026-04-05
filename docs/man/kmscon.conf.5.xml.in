@@ -176,9 +176,9 @@ font-name=Ubuntu Mono
       </varlistentry>
 
       <varlistentry>
-        <term><option>login</option></term>
+        <term><option>command</option></term>
         <listitem>
-          <para>Start the given login process instead of the default process; all arguments following '--' will be be parsed as argv to this process. No more options after '--' will be parsed so use it at the end of the argument string. (default: /bin/login -p)</para>
+          <para>Run a custom command as the session program instead of the default /bin/login -p. When used on the command line, everything after '--' is passed as the command and its arguments. In the configuration file, the argument is parsed as a shell command line. (default: /bin/login -p)</para>
         </listitem>
       </varlistentry>
 

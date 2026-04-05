@@ -56,7 +56,7 @@ static void print_help()
 		"Usage:\n"
 		"\t%1$s [options]\n"
 		"\t%1$s -h [options]\n"
-		"\t%1$s -l [options] -- /bin/login [login-arguments]\n"
+		"\t%1$s -e [options] -- <command> [arguments]\n"
 		"\n"
 		"You can prefix boolean options with \"no-\" to negate them. If an argument is\n"
 		"given multiple times, only the last argument matters if not otherwise stated.\n"
@@ -83,13 +83,14 @@ static void print_help()
 		"\t    --terminal-session          [on]  Enable terminal session\n"
 		"\n"
 		"Terminal Options:\n"
-		"\t-l, --login                 [/bin/login -p]\n"
-		"\t                              Start the given login process instead\n"
-		"\t                              of the default process; all arguments\n"
-		"\t                              following '--' will be be parsed as\n"
-		"\t                              argv to this process. No more options\n"
-		"\t                              after '--' will be parsed so use it at\n"
-		"\t                              the end of the argument string\n"
+	"\t-e, --command               [/bin/login -p]\n"
+	"\t                              Run the given command as the session\n"
+	"\t                              program instead of the default\n"
+	"\t                              /bin/login -p; all arguments following\n"
+	"\t                              '--' will be parsed as argv to this\n"
+	"\t                              command. No more options after '--'\n"
+	"\t                              will be parsed so use it at the end\n"
+	"\t                              of the argument string\n"
 		"\t-t, --term <TERM>           [linux]\n"
 		"\t                              Value of the TERM environment variable\n"
 		"\t                              for the child process\n"
@@ -290,48 +291,48 @@ static const struct conf_type conf_vt = {
 };
 
 /*
- * Login handling
- * The --login option is special in that it can have an unlimited number of
- * arguments on the command-line. So on the command-line it is an boolean option
- * that specifies whether default login or custom login is used.
+ * Command handling
+ * The --command option is special in that it can have an unlimited number of
+ * arguments on the command-line. So on the command-line it is a boolean option
+ * that specifies whether default or custom session command is used.
  * However, the file-parser does simple string-parsing as it does not need the
  * special handling that the command-line does.
  */
 
 static char *def_argv[] = {"/bin/login", "-p", NULL};
 
-static void conf_default_login(struct conf_option *opt)
+static void conf_default_command(struct conf_option *opt)
 {
-	struct kmscon_conf_t *conf = KMSCON_CONF_FROM_FIELD(opt->mem, login);
+	struct kmscon_conf_t *conf = KMSCON_CONF_FROM_FIELD(opt->mem, command);
 
 	opt->type->free(opt);
-	conf->login = false;
+	conf->command = false;
 	conf->argv = def_argv;
 }
 
-static void conf_free_login(struct conf_option *opt)
+static void conf_free_command(struct conf_option *opt)
 {
-	struct kmscon_conf_t *conf = KMSCON_CONF_FROM_FIELD(opt->mem, login);
+	struct kmscon_conf_t *conf = KMSCON_CONF_FROM_FIELD(opt->mem, command);
 
 	if (conf->argv != def_argv)
 		free(conf->argv);
 	conf->argv = NULL;
-	conf->login = false;
+	conf->command = false;
 }
 
-static int conf_parse_login(struct conf_option *opt, bool on, const char *arg)
+static int conf_parse_command(struct conf_option *opt, bool on, const char *arg)
 {
-	struct kmscon_conf_t *conf = KMSCON_CONF_FROM_FIELD(opt->mem, login);
+	struct kmscon_conf_t *conf = KMSCON_CONF_FROM_FIELD(opt->mem, command);
 
 	opt->type->free(opt);
-	conf->login = on;
+	conf->command = on;
 	return 0;
 }
 
-static int conf_copy_login(struct conf_option *opt, const struct conf_option *src)
+static int conf_copy_command(struct conf_option *opt, const struct conf_option *src)
 {
-	struct kmscon_conf_t *conf = KMSCON_CONF_FROM_FIELD(opt->mem, login);
-	struct kmscon_conf_t *s = KMSCON_CONF_FROM_FIELD(src->mem, login);
+	struct kmscon_conf_t *conf = KMSCON_CONF_FROM_FIELD(opt->mem, command);
+	struct kmscon_conf_t *s = KMSCON_CONF_FROM_FIELD(src->mem, command);
 	int ret;
 	char **t;
 
@@ -345,28 +346,28 @@ static int conf_copy_login(struct conf_option *opt, const struct conf_option *sr
 
 	opt->type->free(opt);
 	conf->argv = t;
-	conf->login = s->login;
+	conf->command = s->command;
 	return 0;
 }
 
-static const struct conf_type conf_login = {
+static const struct conf_type conf_command = {
 	.flags = 0,
-	.set_default = conf_default_login,
-	.free = conf_free_login,
-	.parse = conf_parse_login,
-	.copy = conf_copy_login,
+	.set_default = conf_default_command,
+	.free = conf_free_command,
+	.parse = conf_parse_command,
+	.copy = conf_copy_command,
 };
 
-static int aftercheck_login(struct conf_option *opt, int argc, char **argv, int idx)
+static int aftercheck_command(struct conf_option *opt, int argc, char **argv, int idx)
 {
-	struct kmscon_conf_t *conf = KMSCON_CONF_FROM_FIELD(opt->mem, login);
+	struct kmscon_conf_t *conf = KMSCON_CONF_FROM_FIELD(opt->mem, command);
 	int ret = 0;
 	char **t;
 
-	/* parse "--login [...] -- args" arguments */
-	if (argv && conf->login) {
+	/* parse "--command [...] -- args" arguments */
+	if (argv && conf->command) {
 		if (idx >= argc) {
-			fprintf(stderr, "Arguments for --login missing\n");
+			fprintf(stderr, "Arguments for --command missing\n");
 			return -EFAULT;
 		}
 
@@ -387,31 +388,31 @@ static int aftercheck_login(struct conf_option *opt, int argc, char **argv, int 
 	return ret;
 }
 
-static int file_login(struct conf_option *opt, bool on, const char *arg)
+static int file_command(struct conf_option *opt, bool on, const char *arg)
 {
-	struct kmscon_conf_t *conf = KMSCON_CONF_FROM_FIELD(opt->mem, login);
+	struct kmscon_conf_t *conf = KMSCON_CONF_FROM_FIELD(opt->mem, command);
 	char **t;
 	unsigned int size;
 	int ret;
 
 	if (!arg) {
-		log_error("no arguments for 'login' config-option");
+		log_error("no arguments for 'command' config-option");
 		return -EFAULT;
 	}
 
 	ret = shl_split_command_string(arg, &t, &size);
 	if (ret) {
-		log_error("cannot split 'login' config-option argument");
+		log_error("cannot split 'command' config-option argument");
 		return ret;
 	}
 
 	if (size < 1) {
-		log_error("empty argument given for 'login' config-option");
+		log_error("empty argument given for 'command' config-option");
 		return -EFAULT;
 	}
 
 	opt->type->free(opt);
-	conf->login = on;
+	conf->command = on;
 	conf->argv = t;
 	return 0;
 }
@@ -754,8 +755,8 @@ int kmscon_conf_new(struct conf_ctx **out)
 		CONF_OPTION_BOOL(0, "terminal-session", &conf->terminal_session, true),
 
 		/* Terminal Options */
-		CONF_OPTION(0, 'l', "login", &conf_login, aftercheck_login, NULL, file_login,
-			    &conf->login, false),
+		CONF_OPTION(0, 'e', "command", &conf_command, aftercheck_command, NULL, file_command,
+			    &conf->command, false),
 		CONF_OPTION_STRING('t', "term", &conf->term, "linux"),
 		CONF_OPTION_BOOL(0, "reset-env", &conf->reset_env, true),
 		CONF_OPTION_BOOL(0, "backspace-delete", &conf->backspace_delete, true),

@@ -85,9 +85,9 @@ struct kmscon_conf_t {
 	bool terminal_session;
 
 	/* Terminal Options */
-	/* custom login process */
-	bool login;
-	/* argv for login process */
+	/* custom session command */
+	bool command;
+	/* argv for session command */
 	char **argv;
 	/* TERM value */
 	char *term;
