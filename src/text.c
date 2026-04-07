@@ -457,25 +457,15 @@ int kmscon_text_draw(struct kmscon_text *txt, uint64_t id, const uint32_t *ch, s
 	return txt->ops->draw(txt, id, ch, len, width, posx, posy, attr);
 }
 
-/**
- * kmscon_text_draw_pointer:
- * @txt: valid text renderer
- * @x: X-position of the center of the pointer in pixel
- * @y: Y-position of the center of the pointer in pixel
- *
- * This draws a single I glyph at the requested position. The position is a
- * a pixel position! You must precede this call with kmscon_text_prepare().
- * Use this function to feed the mouse pointer into the rendering pipeline
- * and finally call kmscon_text_render().
- *
- * Returns: 0 on success or negative error code if it couldn't be drawn.
- */
-int kmscon_text_draw_pointer(struct kmscon_text *txt, unsigned int x, unsigned int y)
+void kmscon_text_set_pointer(struct kmscon_text *txt, bool visible,
+			     unsigned int col, unsigned int row)
 {
-	if (!txt || !txt->rendering || !txt->ops->draw_pointer)
-		return -EINVAL;
+	if (!txt)
+		return;
 
-	return txt->ops->draw_pointer(txt, x, y);
+	txt->pointer_visible = visible;
+	txt->pointer_col = col;
+	txt->pointer_row = row;
 }
 
 /**
@@ -525,5 +515,15 @@ int kmscon_text_draw_cb(struct tsm_screen *con, uint64_t id, const uint32_t *ch,
 			unsigned int width, unsigned int posx, unsigned int posy,
 			const struct tsm_screen_attr *attr, tsm_age_t age, void *data)
 {
-	return kmscon_text_draw(data, id, ch, len, width, posx, posy, attr);
+	struct kmscon_text *txt = data;
+
+	if (txt->pointer_visible && posx == txt->pointer_col &&
+	    posy == txt->pointer_row) {
+		struct tsm_screen_attr inv = *attr;
+		inv.inverse = !inv.inverse;
+		return kmscon_text_draw(txt, id, ch, len, width, posx, posy,
+				       &inv);
+	}
+
+	return kmscon_text_draw(txt, id, ch, len, width, posx, posy, attr);
 }

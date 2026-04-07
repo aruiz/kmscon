@@ -66,6 +66,10 @@ struct kmscon_text {
 	unsigned int max_rows;
 	bool rendering;
 	enum Orientation orientation;
+
+	bool pointer_visible;
+	unsigned int pointer_col;
+	unsigned int pointer_row;
 };
 
 struct kmscon_text_ops {
@@ -81,7 +85,6 @@ struct kmscon_text_ops {
 	int (*draw)(struct kmscon_text *txt, uint64_t id, const uint32_t *ch, size_t len,
 		    unsigned int width, unsigned int posx, unsigned int posy,
 		    const struct tsm_screen_attr *attr);
-	int (*draw_pointer)(struct kmscon_text *txt, unsigned int x, unsigned int y);
 	int (*render)(struct kmscon_text *txt);
 	void (*abort)(struct kmscon_text *txt);
 };
@@ -109,7 +112,8 @@ int kmscon_text_prepare(struct kmscon_text *txt, struct tsm_screen_attr *attr);
 int kmscon_text_draw(struct kmscon_text *txt, uint64_t id, const uint32_t *ch, size_t len,
 		     unsigned int width, unsigned int posx, unsigned int posy,
 		     const struct tsm_screen_attr *attr);
-int kmscon_text_draw_pointer(struct kmscon_text *txt, unsigned int x, unsigned int y);
+void kmscon_text_set_pointer(struct kmscon_text *txt, bool visible,
+			     unsigned int col, unsigned int row);
 int kmscon_text_render(struct kmscon_text *txt);
 void kmscon_text_abort(struct kmscon_text *txt);
 

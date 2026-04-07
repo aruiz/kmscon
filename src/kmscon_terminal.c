@@ -117,14 +117,6 @@ static void coord_to_cell(struct kmscon_terminal *term, int32_t x, int32_t y, un
 		*posy = h - 1;
 }
 
-static void draw_pointer(struct screen *scr)
-{
-	if (!scr->term->pointer.visible)
-		return;
-
-	kmscon_text_draw_pointer(scr->txt, scr->term->pointer.x, scr->term->pointer.y);
-}
-
 static void do_redraw_screen(struct screen *scr)
 {
 	struct tsm_screen_attr attr;
@@ -137,8 +129,11 @@ static void do_redraw_screen(struct screen *scr)
 
 	tsm_vte_get_def_attr(scr->term->vte, &attr);
 	kmscon_text_prepare(scr->txt, &attr);
+	kmscon_text_set_pointer(scr->txt,
+				scr->term->pointer.visible,
+				scr->term->pointer.posx,
+				scr->term->pointer.posy);
 	tsm_screen_draw(scr->term->console, kmscon_text_draw_cb, scr->txt);
-	draw_pointer(scr);
 	kmscon_text_render(scr->txt);
 
 	ret = uterm_display_swap(scr->disp);
