@@ -249,7 +249,7 @@ if enable_session_dummy
   kmscon_srcs += 'kmscon_dummy.c'
 endif
 if enable_session_terminal
-  kmscon_srcs += 'kmscon_terminal.c'
+  kmscon_srcs += ['kmscon_terminal.c', 'xcursor.c']
 endif
 kmscon = executable('kmscon', kmscon_srcs,
   dependencies: [xkbcommon_deps, libtsm_deps, threads_deps, dl_deps, conf_deps, shl_deps, eloop_deps, uterm_deps],

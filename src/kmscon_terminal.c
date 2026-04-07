@@ -47,6 +47,7 @@
 #include "text.h"
 #include "uterm_input.h"
 #include "uterm_video.h"
+#include "xcursor.h"
 
 #define LOG_SUBSYSTEM "terminal"
 
@@ -201,6 +202,7 @@ static void setup_hw_cursor(struct screen *scr)
 	unsigned int beam_h = fh > 4 ? fh : 20;
 	unsigned int cap_half = beam_h / 6;
 	unsigned int beam_w;
+	struct xcursor_image ximg;
 	uint32_t *pixels;
 	int hot_x = 0, hot_y = 0;
 	int ret;
@@ -209,6 +211,20 @@ static void setup_hw_cursor(struct screen *scr)
 		cap_half = 2;
 	beam_w = 2 * cap_half + 5;
 
+	if (xcursor_load("xterm", beam_h, &ximg) == 0) {
+		ret = uterm_display_setup_cursor(scr->disp, ximg.pixels,
+						 ximg.width, ximg.height,
+						 ximg.xhot, ximg.yhot);
+		free(ximg.pixels);
+		if (!ret) {
+			log_debug("HW cursor (themed) enabled for display %s",
+				  uterm_display_name(scr->disp));
+			scr->hw_cursor = true;
+			return;
+		}
+	}
+
+	/* fall back to the programmatic I-beam */
 	pixels = calloc(beam_w * beam_h, sizeof(uint32_t));
 	if (!pixels)
 		return;
